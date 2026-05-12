@@ -1,0 +1,83 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Prevent memory spikes
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # Batch before exporting — reduces network calls
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+  # Stamp every span/metric/log with environment
+  attributes/add_env:
+    actions:
+      - key: deployment.environment
+        value: ${ENVIRONMENT}
+        action: insert
+      - key: service.namespace
+        value: accounting-software
+        action: insert
+
+  # Drop health-check noise from traces
+  filter/drop_health:
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
+        - 'attributes["http.route"] == "/metrics"'
+
+exporters:
+  # Metrics → Prometheus (remote write)
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    tls:
+      insecure: true
+
+  # Traces → Tempo
+  otlp/tempo:
+    endpoint: http://tempo:4317
+    tls:
+      insecure: true
+
+  # Logs → Loki
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    default_labels_enabled:
+      exporter: false
+      job: true
+    tls:
+      insecure: true
+
+  # Debug: print to collector stdout (disable in prod)
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, filter/drop_health, attributes/add_env, batch]
+      exporters:  [otlp/tempo]
+
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, attributes/add_env, batch]
+      exporters:  [prometheusremotewrite]
+
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, attributes/add_env, batch]
+      exporters:  [loki]
+
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888   # collector self-metrics for Prometheus

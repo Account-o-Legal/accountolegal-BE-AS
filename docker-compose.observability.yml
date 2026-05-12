@@ -1,0 +1,104 @@
+version: "3.9"
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  tempo_data:
+
+services:
+
+  # ── OpenTelemetry Collector ──────────────────────────────
+  # Receives traces/metrics/logs from the app via OTLP,
+  # then fans them out to Tempo, Prometheus, and Loki.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./infra/observability/otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC  ← app sends here
+      - "4318:4318"   # OTLP HTTP  ← app sends here (alternative)
+      - "8888:8888"   # Collector self-metrics (scraped by Prometheus)
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ── Prometheus ───────────────────────────────────────────
+  # Scrapes metrics from OTel Collector + app /metrics endpoint.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yaml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-remote-write-receiver"   # accepts remote-write from OTel Collector
+    volumes:
+      - ./infra/observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ── Grafana Tempo ────────────────────────────────────────
+  # Distributed trace storage — receives OTLP traces from Collector.
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./infra/observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API (queried by Grafana)
+      - "4327:4317"   # OTLP gRPC ingest (separate port to avoid clash with Collector)
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ── Grafana Loki ─────────────────────────────────────────
+  # Log aggregation — receives structured JSON logs from Collector.
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./infra/observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ── Grafana ──────────────────────────────────────────────
+  # Unified dashboard — Prometheus, Tempo, and Loki pre-wired.
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    networks:
+      - observability
+    restart: unless-stopped
